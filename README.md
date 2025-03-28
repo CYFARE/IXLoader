@@ -32,6 +32,12 @@ Features In-Development:
 
 - Create from multiple input images
 
+Sample Payloaded Image:
+
+<h1 align="center">
+  <img src="https://github.com/CYFARE/IXLoader/blob/main/assets/sample_hex_01.png" alt="Sample Payloaded Image">
+</h1>
+
 ## Setup & Usage
 
 ### Setup
