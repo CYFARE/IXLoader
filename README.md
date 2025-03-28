@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/-MPLv2.0-61DAFB?style=for-the-badge" alt="License: GPLv2.0">&nbsp;
 </h2>
 
-**IXLoader**, or **I**mage e**X**ploit **L**oader is a tool designed to generate large sets of image payloads for security testers.
+**IXLoader**, or **I**mage e**X**ploit **L**oader - A tool designed to generate large sets of image payloads for security research.
 
 ## Releases & Features
 
