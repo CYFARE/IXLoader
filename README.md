@@ -12,25 +12,29 @@
 
 ### Release Cycle
 
-This is a rolling release tool, which means that new features will not follow any release cycles and will constantly be added anytime. So always make sure you git clone the project periodically! The feature list below will be updated as the features are added, so you can reffer the new feature sets easily.
+This is a rolling release tool, which means that new features will not follow any release cycles and will constantly be added anytime. So always make sure you `git clone` the project periodically! The feature list below will be updated as the features are added, so you can refer to the new feature sets easily.
 
 ### Features
 
-```
-- Inject Mode
-  - Injects Payload Into Header
-  - Injects Payload Into Body
-  - Injects Payload Into Trailer
-- DoS Generator
-  - Pixel Flood Image
-  - Long Body Image
-  - Decompression Bomb
-  - Color Profile DoS
-```
-
-Features In-Development:
-
-- Create from multiple input images
+* **Input Flexibility**: Process a single image file or an entire folder containing multiple images (`-i`/`--input`). Supports common image formats (PNG, JPG/JPEG, GIF, etc.).
+* **Automatic Multiprocessing**: Intelligently utilizes multiple CPU cores for significantly faster processing of large image sets or payload lists (no manual thread count needed).
+* **Configurable Output**: Specify a custom output directory for generated images (`-o`/`--output`, defaults to `loaded`). The directory is cleared before each run.
+* **Verbose Output**: Control the level of detail printed during execution using `-v` or `-vv`.
+* **Payload Injection Mode**:
+    * Injects each payload from a specified file (`-p`/`--payloads`) into input image(s).
+    * Creates 3 variants for each image-payload combination by injecting into:
+        * Image Header
+        * Image Body (near middle or specific markers)
+        * Image Trailer (appended)
+* **DoS Image Generation Mode** (`--dosimage`):
+    * Generates various types of potentially Denial-of-Service-inducing images.
+    * Ignores payload file (`-p`).
+    * Current DoS types include:
+        * Pixel Flood (Large dimension PNG)
+        * Long Body (PNG with large metadata)
+        * Long Body (JPG with large comment segment)
+        * Decompression Bomb (PNG declaring large dimensions)
+        * Color Profile DoS (PNG with large declared iCCP chunk)
 
 Sample Payloaded Image:
 
@@ -45,29 +49,44 @@ Sample Payloaded Image:
 ```bash
 cd ~ && git clone https://github.com/CYFARE/IXLoader.git
 cd IXLoader
-python -m venv venv
-source venv/bin/activate
+python3 -m venv venv # Or use 'python' depending on your system
+source venv/bin/activate # On Windows use `venv\Scripts\activate`
+# Install dependencies
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
 ### Usage
 
-- Get any type of payload set in a file (provided example: sample_xss.txt)
-- Get some clean image (provided example: clean.png)
-- Run:
+#### 1. Inject Payloads into a Single Image
 
 ```bash
+# Inject payloads from sample_xss.txt into clean.png
+# Output goes to the default 'loaded/' directory
+# Uses automatic multithreading based on your CPU cores
 python load.py -i clean.png -p sample_xss.txt
 ```
 
-- You will see folder created called 'loaded' will all new image payloads. Please rename the folder to anything else so that you don't loose the set of payloads on next run!
-- For generating DoS images using clean.png, run:
+#### 2. Inject Payloads into All Images in a Folder
 
 ```bash
-python load.py -i clean.png --dosimage
+# Create a folder (e.g., 'input_images') and place clean images inside
+# Inject payloads into all supported images found in 'input_images/'
+# Save results to a custom directory 'payloaded_output/'
+python load.py -i input_images -p sample_xss.txt
 ```
 
-- You will see folder called 'loaded' with 4 DoS images created using clean.png
+#### 3. Generate DoS Images
+
+```bash
+# Generate various DoS image types.
+# The input image (-i) is required by the script but may be ignored by specific DoS generators.
+# Payloads (-p) are ignored in this mode.
+# Output goes to the 'dos_output/' directory
+python load.py -i clean.png --dosimage -o dos_output
+```
+
+**Important:** The output directory (default loaded/ or specified with -o) is cleared before each run. If you want to keep the generated images, rename or move the output folder after the script finishes!
 
 ## Support
 
