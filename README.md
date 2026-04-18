@@ -16,25 +16,25 @@ This is a rolling release tool, which means that new features will not follow an
 
 ### Features
 
-* **Input Flexibility**: Process a single image file or an entire folder containing multiple images (`-i`/`--input`). Supports common image formats (PNG, JPG/JPEG, GIF, etc.).
-* **Automatic Multiprocessing**: Intelligently utilizes multiple CPU cores for significantly faster processing of large image sets or payload lists (no manual thread count needed).
-* **Configurable Output**: Specify a custom output directory for generated images (`-o`/`--output`, defaults to `loaded`). The directory is cleared before each run.
-* **Verbose Output**: Control the level of detail printed during execution using `-v` or `-vv`.
-* **Payload Injection Mode**:
-    * Injects each payload from a specified file (`-p`/`--payloads`) into input image(s).
-    * Creates 3 variants for each image-payload combination by injecting into:
-        * Image Header
-        * Image Body (near middle or specific markers)
-        * Image Trailer (appended)
-* **DoS Image Generation Mode** (`--dosimage`):
-    * Generates various types of potentially Denial-of-Service-inducing images.
-    * Ignores payload file (`-p`).
-    * Current DoS types include:
-        * Pixel Flood (Large dimension PNG)
-        * Long Body (PNG with large metadata)
-        * Long Body (JPG with large comment segment)
-        * Decompression Bomb (PNG declaring large dimensions)
-        * Color Profile DoS (PNG with large declared iCCP chunk)
+| Feature | Description |
+|---------|-------------|
+| **Input Flexibility** | Process single files or entire folders (`-i`/`--input`). Supports PNG, JPG/JPEG, GIF, BMP, TIFF, WebP, AVIF/HEIC, ICO, SVG, JP2 |
+| **Smart Multiprocessing** | Auto-selects Thread vs Process executor based on workload. Manual override with `--executor {thread,process}` |
+| **Binary Payload Support** | Multiple payload formats: `text` (default), `hex`, `base64`, `file` via `--payload-format` |
+| **Payload Templating** | Dynamic placeholders: `{{FILE}}`, `{{RAND:n}}`, `{{DIMS}}`, `{{UUID}}`, `{{TIMESTAMP}}` |
+| **Selective Mutations** | Choose injection points: `header`, `body`, `trailer`, `exif`, `xmp`, `text_chunk`, `icc` via `--mutations` |
+| **Advanced Injection** | Format-aware injection with proper chunk structures (PNG IHDR/tEXt/iCCP, JPEG COM/APPn/EXIF, GIF Comment Extensions) |
+| **Valid CRC Generation** | Proper CRC32 calculation for PNG chunks (no more placeholder CRCs) |
+| **DoS Image Generation** | Create stress-test images: `pixel_flood`, `long_body`, `decompression_bomb`, `iccp_dos` via `--dos-types` |
+| **Safety Controls** | `--force` required for non-empty output dirs, memory checks before large allocations, `--i-understand` for DoS mode |
+| **Resumable Operations** | `--resume` skips existing files, allowing interrupted runs to continue |
+| **Flexible File Discovery** | `--pattern` for glob filtering, `--recursive` for directory traversal |
+| **Machine-Readable Output** | Generate `manifest.json` or `manifest.csv` with SHA256, size, status, parse validation |
+| **Structured Logging** | `-v`/`--verbose` for INFO, `-vv` for DEBUG, `--log-file` for persistent logs |
+| **Reproducibility** | `--seed` for deterministic random generation and ordering |
+| **Validation** | Optional post-injection validation with Pillow (`--validate`) |
+| **Per-Format Statistics** | Success/failure breakdown by image format and injection type in summary |
+| **Collision-Resistant Names** | Hash-based filename generation prevents `a.b.png` vs `a_b.png` collisions |
 
 Sample Payloaded Image:
 
@@ -47,7 +47,7 @@ Sample Payloaded Image:
 ### Setup
 
 ```bash
-cd ~ && git clone https://github.com/CYFARE/IXLoader.git
+cd ~ && git clone https://github.com/CYFARE/IXLoader.git 
 cd IXLoader
 python3 -m venv venv # Or use 'python' depending on your system
 source venv/bin/activate # On Windows use `venv\Scripts\activate`
@@ -58,39 +58,89 @@ python -m pip install -r requirements.txt
 
 ### Usage
 
-#### 1. Inject Payloads into a Single Image
+#### 1. Inject Payloads (Basic)
 
 ```bash
-# Inject payloads from sample_xss.txt into clean.png
-# Output goes to the default 'loaded/' directory
-# Uses automatic multithreading based on your CPU cores
-python load.py -i clean.png -p sample_xss.txt
+# Inject payloads into a single image
+python load.py inject -i clean.png -p sample_xss.txt
+
+# Inject into all images in a folder with recursive scan
+python load.py inject -i input_images/ -p payloads.txt --recursive
 ```
 
-#### 2. Inject Payloads into All Images in a Folder
+#### 2. Advanced Injection Options
 
 ```bash
-# Create a folder (e.g., 'input_images') and place clean images inside
-# Inject payloads into all supported images found in 'input_images/'
-# Save results to a custom directory 'payloaded_output/'
-python load.py -i input_images -p sample_xss.txt
+# Select specific mutations only (header and trailer)
+python load.py inject -i images/ -p payloads.txt --mutations header,trailer
+
+# Use hex-encoded binary payloads
+python load.py inject -i clean.png -p binary.hex --payload-format hex
+
+# Load payloads from files (each payload is a file path)
+python load.py inject -i clean.png -p file_list.txt --payload-format file
+
+# Add EXIF and XMP injection for JPEGs with validation
+python load.py inject -i photos/ -p payloads.txt --mutations header,exif,xmp --validate
+
+# Dry run to preview what would be generated
+python load.py inject -i images/ -p payloads.txt --dry-run
+
+# Resume interrupted run (skip existing files)
+python load.py inject -i images/ -p payloads.txt --resume
+
+# Custom pattern and output with logging
+python load.py inject -i input/ -p payloads.txt --pattern "*.png" -o output/ --log-file run.log -v
 ```
 
 #### 3. Generate DoS Images
 
 ```bash
-# Generate various DoS image types.
-# The input image (-i) is required by the script but may be ignored by specific DoS generators.
-# Payloads (-p) are ignored in this mode.
-# Output goes to the 'dos_output/' directory
-python load.py -i clean.png --dosimage -o dos_output
+# Generate all DoS types (requires acknowledgment)
+python load.py dos --i-understand -o dos_output/
+
+# Generate specific DoS types only
+python load.py dos --i-understand --dos-types pixel_flood,decompression_bomb -o dos/
+
+# Resume partial DoS generation
+python load.py dos --i-understand --dos-types long_body --resume -o dos/
 ```
 
-**Important:** The output directory (default loaded/ or specified with -o) is cleared before each run. If you want to keep the generated images, rename or move the output folder after the script finishes!
+#### 4. Process & Report
+
+```bash
+# Generate JSON manifest with SHA256 hashes
+python load.py inject -i images/ -p payloads.txt --manifest --manifest-format json
+
+# Generate CSV report for spreadsheet analysis
+python load.py inject -i images/ -p payloads.txt --manifest --manifest-format csv
+
+# Full verbose with validation and manifest
+python load.py inject -i images/ -p payloads.txt -vv --validate --manifest --log-file debug.log
+```
+
+#### 5. Reproducible & Safe Operations
+
+```bash
+# Deterministic run with seed (same output order every time)
+python load.py inject -i images/ -p payloads.txt --seed 42
+
+# Force overwrite existing output directory (DANGEROUS - use carefully)
+python load.py inject -i images/ -p payloads.txt --force
+
+# Process with memory safety checks (auto-enabled for DoS)
+python load.py inject -i large_images/ -p payloads.txt --executor process
+```
+
+**Important Safety Notes:**
+- Output directory is protected: requires `--force` to overwrite non-empty directories
+- DoS mode requires `--i-understand` flag to acknowledge risks
+- Use `--resume` to continue interrupted runs without regenerating existing files
+- Memory checks prevent OOM when generating large DoS images
 
 ## Support
 
-Boost Cyfare by spreading a word and considering your support: https://cyfare.net/apps/Social/
+Boost Cyfare by spreading a word and considering your support: https://cyfare.net/apps/Social/ 
 
 ## License
 
