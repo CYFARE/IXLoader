@@ -19,6 +19,7 @@ Developed By:
 import argparse
 import os
 import shutil
+import signal
 import concurrent.futures
 import multiprocessing
 from PIL import Image, PngImagePlugin, ExifTags, TiffImagePlugin
@@ -37,12 +38,17 @@ import uuid
 import re
 import zlib
 import logging
-import psutil
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable, Any, Union
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 import glob
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 # --- Type Definitions ---
 class InjectionType(Enum):
@@ -86,8 +92,26 @@ class ProcessingSummary:
 # --- Constants ---
 SUPPORTED_IMAGE_EXTENSIONS: set = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.webp', '.avif', '.heic', '.ico', '.svg', '.jp2'}
 DEFAULT_OUTPUT_DIR: str = 'loaded'
-MUTATIONS_PER_PAYLOAD: int = 3  # header, body, trailer (legacy count)
 DEFAULT_WORKERS: int = 4
+DEFAULT_TASK_TIMEOUT: int = 300
+DEFAULT_PNG_TEXT_KEYWORD: str = 'Comment'
+
+
+@contextmanager
+def _max_image_pixels(limit):
+    """Temporarily override Pillow's MAX_IMAGE_PIXELS limit."""
+    prev = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = limit
+    try:
+        yield
+    finally:
+        Image.MAX_IMAGE_PIXELS = prev
+
+
+# --- Error Handling (defined early for forward references) ---
+class ImageProcessingError(Exception):
+    """Custom exception for image processing errors."""
+    pass
 
 # Format header sizes for correct injection points
 FORMAT_HEADERS: Dict[str, int] = {
@@ -170,15 +194,24 @@ def check_output_safety(output_dir: str, force: bool = False, logger: logging.Lo
 
         # Additional safety: prevent wiping root or current directory
         abs_path = os.path.abspath(output_dir)
-        dangerous_paths = ['/', '\', '.', '..', os.path.expanduser('~'), '/home', '/root', 'C:\\', 'C:/']
+        dangerous_paths = ['/', '\\', os.path.expanduser('~'), '/home', '/root', 'C:\\', 'C:/']
         if abs_path.rstrip('/') in [p.rstrip('/') for p in dangerous_paths] or abs_path == os.path.abspath('.') and not force:
             if logger:
                 logger.error(f"Refusing to operate on potentially dangerous path: '{output_dir}'. Use --force if you understand the risks.")
             return False
     return True
 
+_psutil_warned = False
+
+
 def check_memory_available(required_mb: int, logger: logging.Logger = None) -> bool:
-    """Check if sufficient memory is available."""
+    """Check if sufficient memory is available. Permissive when psutil is unavailable."""
+    global _psutil_warned
+    if psutil is None:
+        if logger and not _psutil_warned:
+            logger.info("psutil not installed; memory checks disabled")
+            _psutil_warned = True
+        return True
     try:
         available_mb = psutil.virtual_memory().available / (1024 * 1024)
         if available_mb < required_mb:
@@ -190,6 +223,18 @@ def check_memory_available(required_mb: int, logger: logging.Logger = None) -> b
         return True  # If psutil fails, proceed with caution
 
 # --- Payload Handling ---
+def _tpl_rand(n) -> str:
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=int(n)))
+
+
+def _tpl_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _tpl_timestamp() -> str:
+    return str(int(time.time()))
+
+
 class PayloadProcessor:
     """Handle payload parsing, decoding, and templating."""
 
@@ -197,9 +242,9 @@ class PayloadProcessor:
         self.format_type = format_type
         self.logger = logger
         self.template_vars = {
-            'RAND': lambda n: ''.join(random.choices(string.ascii_letters + string.digits, k=int(n))),
-            'UUID': lambda: str(uuid.uuid4()),
-            'TIMESTAMP': lambda: str(int(time.time())),
+            'RAND': _tpl_rand,
+            'UUID': _tpl_uuid,
+            'TIMESTAMP': _tpl_timestamp,
         }
 
     def process_payload(self, payload: str, context: Dict = None) -> bytes:
@@ -277,7 +322,7 @@ def create_png_chunk(chunk_type: bytes, chunk_data: bytes) -> bytes:
 class FormatHandler:
     """Base class for format-specific injection handlers."""
 
-    def __init__(self, logger: logging.Logger = None):
+    def __init__(self, logger: logging.Logger = None, **handler_kwargs):
         self.logger = logger
 
     def inject_header(self, image_data: bytes, payload: bytes) -> bytes:
@@ -301,6 +346,10 @@ class FormatHandler:
 class PNGHandler(FormatHandler):
     """PNG-specific injection handler with proper chunk support."""
 
+    def __init__(self, logger: logging.Logger = None, png_text_keyword: str = DEFAULT_PNG_TEXT_KEYWORD, **handler_kwargs):
+        super().__init__(logger)
+        self.png_text_keyword = png_text_keyword
+
     def inject_header(self, image_data: bytes, payload: bytes) -> bytes:
         if len(image_data) < 8:
             raise ImageProcessingError("PNG file too short for header injection")
@@ -319,7 +368,7 @@ class PNGHandler(FormatHandler):
     def inject_text_chunk(self, image_data: bytes, payload: bytes) -> bytes:
         # Create tEXt chunk with proper CRC
         # tEXt format: keyword (1-79 bytes) + null + text
-        keyword = b'Comment'
+        keyword = self.png_text_keyword.encode('latin-1', errors='replace')
         text_data = keyword + b'\x00' + payload[:65535]  # Limit size
         chunk = create_png_chunk(b'tEXt', text_data)
 
@@ -360,6 +409,8 @@ class JPEGHandler(FormatHandler):
         # Find SOS marker or use midpoint
         sos_pos = image_data.find(JPEG_MARKERS['SOS'])
         if sos_pos > 0:
+            if sos_pos + 4 > len(image_data):
+                raise ImageProcessingError("Truncated JPEG: SOS segment length unreadable")
             # Insert after SOS marker and length field
             segment_len = struct.unpack('>H', image_data[sos_pos+2:sos_pos+4])[0]
             insertion_point = sos_pos + 2 + segment_len
@@ -410,9 +461,17 @@ class GIFHandler(FormatHandler):
             pos += block_size
         comment_block += b'\x00'
 
-        # Find image separator or midpoint
-        img_sep = image_data.find(b'\x2C')  # Image separator
-        if img_sep > 6:
+        # Compute search start past header (6) + Logical Screen Descriptor (7) + GCT if present.
+        # Byte at offset 10 is the packed byte: bit 7 = GCT flag, bits 0-2 = GCT size exponent.
+        search_start = 13
+        if len(image_data) >= 11:
+            packed = image_data[10]
+            if packed & 0x80:  # GCT flag set
+                gct_size = 3 * (2 ** ((packed & 0x07) + 1))
+                search_start = 13 + gct_size
+
+        img_sep = image_data.find(b'\x2C', search_start)  # Image separator, skipping GCT
+        if img_sep > search_start - 1:
             return image_data[:img_sep] + comment_block + image_data[img_sep:]
 
         mid = len(image_data) // 2
@@ -443,11 +502,11 @@ def register_handler(ext: str, handler_class: type):
     """Register a format handler."""
     HANDLERS[ext.lower()] = handler_class
 
-def get_handler(ext: str, logger: logging.Logger = None) -> FormatHandler:
-    """Get appropriate handler for file extension."""
+def get_handler(ext: str, logger: logging.Logger = None, **handler_kwargs) -> FormatHandler:
+    """Get appropriate handler for file extension. Extra kwargs are format-specific."""
     ext = ext.lower().lstrip('.')
     handler_class = HANDLERS.get(ext, FormatHandler)
-    return handler_class(logger)
+    return handler_class(logger, **handler_kwargs)
 
 # Register handlers
 register_handler('png', PNGHandler)
@@ -456,18 +515,14 @@ register_handler('jpeg', JPEGHandler)
 register_handler('gif', GIFHandler)
 register_handler('bmp', BMPHandler)
 
-# --- Error Handling ---
-class ImageProcessingError(Exception):
-    """Custom exception for image processing errors."""
-    pass
-
 # --- Injection Functions ---
 def inject_payload(image_path: str, payload_bytes: bytes, output_path: str,
-                   injection_type: str, logger: logging.Logger = None) -> MutationResult:
+                   injection_type: str, logger: logging.Logger = None,
+                   **handler_kwargs) -> MutationResult:
     """Injects payload into an image using appropriate format handler."""
     try:
         ext = os.path.splitext(image_path)[1].lower().lstrip('.')
-        handler = get_handler(ext, logger)
+        handler = get_handler(ext, logger, **handler_kwargs)
 
         with open(image_path, 'rb') as f:
             image_data = f.read()
@@ -480,7 +535,9 @@ def inject_payload(image_path: str, payload_bytes: bytes, output_path: str,
         new_data = injection_method(image_data, payload_bytes)
 
         # Write output
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        dirname = os.path.dirname(output_path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
         with open(output_path, 'wb') as f:
             f.write(new_data)
 
@@ -513,12 +570,16 @@ def inject_payload(image_path: str, payload_bytes: bytes, output_path: str,
             error=error_msg
         )
 
-def validate_output(image_path: str, logger: logging.Logger = None) -> bool:
-    """Validate that output image can be opened by Pillow."""
+def validate_output(image_path: str, logger: logging.Logger = None, deep: bool = False) -> bool:
+    """Validate that output image can be opened by Pillow. Optionally force pixel decode."""
     try:
-        Image.MAX_IMAGE_PIXELS = None  # Disable limit for validation
-        with Image.open(image_path) as img:
-            img.verify()
+        with _max_image_pixels(None):
+            with Image.open(image_path) as img:
+                img.verify()
+            if deep:
+                # verify() closes the underlying file; reopen for decode.
+                with Image.open(image_path) as img:
+                    img.load()
         return True
     except Exception as e:
         if logger:
@@ -531,7 +592,6 @@ class DosImageCreator:
 
     def __init__(self, logger: logging.Logger = None):
         self.logger = logger
-        Image.MAX_IMAGE_PIXELS = None  # Disable safety limit
 
     def create_pixel_flood(self, output_path: str) -> bool:
         """Create large dimension image."""
@@ -542,19 +602,20 @@ class DosImageCreator:
         if not check_memory_available(required_mb + 500, self.logger):
             return False
 
-        for width, height in dims:
-            try:
-                if self.logger:
-                    self.logger.info(f"Attempting pixel flood: {width}x{height}")
-                img = Image.new('RGB', (width, height), color='white')
-                img.save(output_path)
-                if self.logger:
-                    self.logger.info(f"Created pixel flood: {output_path}")
-                return True
-            except (MemoryError, ValueError) as e:
-                if self.logger:
-                    self.logger.warning(f"Failed pixel flood {width}x{height}: {e}")
-                continue
+        with _max_image_pixels(None):
+            for width, height in dims:
+                try:
+                    if self.logger:
+                        self.logger.info(f"Attempting pixel flood: {width}x{height}")
+                    img = Image.new('RGB', (width, height), color='white')
+                    img.save(output_path)
+                    if self.logger:
+                        self.logger.info(f"Created pixel flood: {output_path}")
+                    return True
+                except (MemoryError, ValueError) as e:
+                    if self.logger:
+                        self.logger.warning(f"Failed pixel flood {width}x{height}: {e}")
+                    continue
         return False
 
     def create_long_body(self, output_path: str) -> bool:
@@ -601,10 +662,11 @@ class DosImageCreator:
         """Create PNG with mismatched declared dimensions."""
         try:
             width, height = 1, 1
-            img = Image.new('RGB', (width, height), color='white')
+            with _max_image_pixels(None):
+                img = Image.new('RGB', (width, height), color='white')
 
-            buffer = io.BytesIO()
-            img.save(buffer, format="PNG")
+                buffer = io.BytesIO()
+                img.save(buffer, format="PNG")
             img_data = bytearray(buffer.getvalue())
 
             # Find IHDR
@@ -731,56 +793,112 @@ def generate_safe_filename(base_name: str, ext: str, payload_idx: int,
 
     return output_path
 
+# --- Worker Configuration ---
+@dataclass(frozen=True)
+class WorkerConfig:
+    """Picklable configuration passed to each worker process."""
+    verbose: int
+    log_file: Optional[str]
+    task_timeout: int
+    png_text_keyword: str
+    validate: bool
+    validate_deep: bool
+    payload_format: str
+    resume: bool
+
+
+# --- Worker-Process State (reset per fork) ---
+_worker_logger: Optional[logging.Logger] = None
+_worker_payload_processor: Optional[PayloadProcessor] = None
+_worker_sigalrm_installed: bool = False
+
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError("task exceeded task-timeout seconds")
+
+
+def _worker_init(cfg: WorkerConfig) -> logging.Logger:
+    """Lazy per-worker initialization. Idempotent within a single process."""
+    global _worker_logger, _worker_payload_processor, _worker_sigalrm_installed
+    if _worker_logger is None:
+        _worker_logger = setup_logging(cfg.verbose, cfg.log_file)
+    if _worker_payload_processor is None:
+        _worker_payload_processor = PayloadProcessor(cfg.payload_format, _worker_logger)
+    if cfg.task_timeout > 0 and not _worker_sigalrm_installed:
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        _worker_sigalrm_installed = True
+    return _worker_logger
+
+
 # --- Task Processing ---
-def process_task(task: Tuple, args, logger: logging.Logger) -> List[MutationResult]:
-    """Process a single image-payload task."""
-    img_path, payload_str, payload_idx, payload_processor = task
+def mutations_for_ext(requested: List[str], ext: str) -> List[str]:
+    """Filter the requested mutations to those compatible with a given extension."""
+    ext = ext.lower()
+    mutations = []
+    if 'header' in requested:
+        mutations.append('header')
+    if 'body' in requested:
+        mutations.append('body')
+    if 'trailer' in requested:
+        mutations.append('trailer')
+    if 'exif' in requested and ext in ('.jpg', '.jpeg', '.tiff'):
+        mutations.append('exif')
+    if 'xmp' in requested and ext in ('.jpg', '.jpeg'):
+        mutations.append('xmp')
+    if 'text_chunk' in requested and ext == '.png':
+        mutations.append('text_chunk')
+    return mutations
 
-    results = []
-    ext = os.path.splitext(img_path)[1].lower()
-    base_name = os.path.splitext(os.path.basename(img_path))[0]
 
-    # Process payload with templating
+def process_task(task: Tuple, cfg: WorkerConfig) -> List[MutationResult]:
+    """Process a single image-payload task using pre-computed (mutation, output_path) pairs."""
+    img_path, payload_str, payload_idx, mutation_outputs = task
+    logger = _worker_init(cfg)
+
+    # Build context and process payload once per task
     context = {'file': img_path}
     try:
         with Image.open(img_path) as img:
             context['dims'] = f"{img.width}x{img.height}"
-    except:
+    except Exception:
         pass
 
-    payload_bytes = payload_processor.process_payload(payload_str, context)
+    payload_bytes = _worker_payload_processor.process_payload(payload_str, context)
 
-    # Determine which mutations to apply
-    mutations = []
-    if 'header' in args.mutations:
-        mutations.append('header')
-    if 'body' in args.mutations:
-        mutations.append('body')
-    if 'trailer' in args.mutations:
-        mutations.append('trailer')
-    if 'exif' in args.mutations and ext in ('.jpg', '.jpeg', '.tiff'):
-        mutations.append('exif')
-    if 'xmp' in args.mutations and ext in ('.jpg', '.jpeg'):
-        mutations.append('xmp')
-    if 'text_chunk' in args.mutations and ext == '.png':
-        mutations.append('text_chunk')
-
-    for mutation in mutations:
-        output_path = generate_safe_filename(
-            base_name, ext, payload_idx, mutation, args.output
-        )
-
+    results = []
+    for mutation, output_path in mutation_outputs:
         # Skip if resuming and file exists
-        if args.resume and os.path.exists(output_path):
+        if cfg.resume and os.path.exists(output_path):
             logger.debug(f"Skipping existing file: {output_path}")
             continue
 
-        result = inject_payload(img_path, payload_bytes, output_path, mutation, logger)
-        result.payload_idx = payload_idx
+        try:
+            if cfg.task_timeout > 0:
+                signal.alarm(cfg.task_timeout)
 
-        # Validate if requested
-        if args.validate and result.status == 'success':
-            result.parses = validate_output(output_path, logger)
+            result = inject_payload(
+                img_path, payload_bytes, output_path, mutation, logger,
+                png_text_keyword=cfg.png_text_keyword,
+            )
+            result.payload_idx = payload_idx
+
+            if cfg.validate and result.status == 'success':
+                result.parses = validate_output(output_path, logger, deep=cfg.validate_deep)
+        except TimeoutError:
+            logger.warning(f"Timeout on {img_path} mutation={mutation}")
+            result = MutationResult(
+                input_path=img_path,
+                payload_idx=payload_idx,
+                mutation=mutation,
+                output_path=output_path,
+                sha256='',
+                size=0,
+                status='failed',
+                error='timeout',
+            )
+        finally:
+            if cfg.task_timeout > 0:
+                signal.alarm(0)
 
         results.append(result)
 
@@ -843,26 +961,87 @@ def cmd_inject(args, logger: logging.Logger) -> int:
 
     logger.info(f"Loaded {len(payloads)} payloads")
 
+    # File-mode pre-flight: all payload paths must exist before we start work
+    if args.payload_format == 'file':
+        missing = [p for p in payloads if not os.path.isfile(p)]
+        if missing:
+            for p in missing:
+                logger.error(f"Payload file not found: {p}")
+            logger.error(f"{len(missing)} missing payload file(s); aborting before task execution.")
+            return 1
+
     # Collect input files
     image_paths = collect_input_files(args.input, args.pattern, args.recursive, logger)
     if not image_paths:
         logger.error("No input files found")
         return 1
 
-    # Setup payload processor
-    payload_processor = PayloadProcessor(args.payload_format, logger)
-
-    # Prepare tasks
+    # Prepare tasks: mutation filtering + filename generation happen in the main process
+    # so the collision set is populated correctly and workers never call generate_safe_filename.
     tasks = []
+    existing: set = set()
+    skipped_no_mutations = 0
     for img_path in image_paths:
+        ext = os.path.splitext(img_path)[1].lower()
+        base_name = os.path.splitext(os.path.basename(img_path))[0]
+        mutations = mutations_for_ext(args.mutations, ext)
+        if not mutations:
+            skipped_no_mutations += 1
+            logger.debug(f"No applicable mutations for {img_path} (ext={ext})")
+            continue
         for i, payload in enumerate(payloads):
-            tasks.append((img_path, payload, i+1, payload_processor))
+            payload_idx = i + 1
+            mutation_outputs = []
+            for mutation in mutations:
+                output_path = generate_safe_filename(
+                    base_name, ext, payload_idx, mutation, args.output, existing=existing
+                )
+                existing.add(output_path)
+                mutation_outputs.append((mutation, output_path))
+            tasks.append((img_path, payload, payload_idx, mutation_outputs))
 
-    logger.info(f"Prepared {len(tasks)} tasks")
+    total_mutations = sum(len(t[3]) for t in tasks)
+    logger.info(f"Prepared {len(tasks)} tasks ({total_mutations} mutations); "
+                f"skipped {skipped_no_mutations} file(s) with no applicable mutations")
+
+    # Dry-run: log planned outputs and exit before any executor work
+    if args.dry_run:
+        logger.info("--dry-run: planned outputs:")
+        for img_path, _, payload_idx, mutation_outputs in tasks:
+            for mutation, output_path in mutation_outputs:
+                logger.info(f"  {img_path} -> p{payload_idx} m{mutation} -> {output_path}")
+        logger.info(f"Dry-run complete: {total_mutations} planned mutations, 0 written")
+        return 0
+
+    if not tasks:
+        logger.error("No tasks to run after mutation filtering")
+        return 1
 
     # Setup executor
     workers = get_optimal_workers(args.executor)
     logger.info(f"Using {workers} workers ({args.executor or 'auto'})")
+
+    # SIGALRM only works in the main thread, so task-timeout is only honored in process executors.
+    effective_timeout = args.task_timeout
+    if args.task_timeout > 0 and args.executor != 'process':
+        logger.warning(
+            "--task-timeout is only enforced with --executor process (SIGALRM requires the main thread); "
+            "ignoring timeout for thread-based executor"
+        )
+        effective_timeout = 0
+    elif effective_timeout > 0:
+        logger.info(f"Task timeout set to {effective_timeout}s; note that Pillow's C decode paths may not honor SIGALRM")
+
+    cfg = WorkerConfig(
+        verbose=args.verbose,
+        log_file=args.log_file,
+        task_timeout=effective_timeout,
+        png_text_keyword=args.png_text_keyword,
+        validate=args.validate,
+        validate_deep=args.validate_deep,
+        payload_format=args.payload_format,
+        resume=args.resume,
+    )
 
     all_results = []
 
@@ -871,7 +1050,7 @@ def cmd_inject(args, logger: logging.Logger) -> int:
 
     with tqdm(total=len(tasks), desc="Processing", disable=args.verbose >= 2) as pbar:
         with executor_class(max_workers=workers) as executor:
-            futures = {executor.submit(process_task, task, args, logger): task for task in tasks}
+            futures = {executor.submit(process_task, task, cfg): task for task in tasks}
 
             for future in concurrent.futures.as_completed(futures):
                 try:
@@ -917,6 +1096,10 @@ def cmd_dos(args, logger: logging.Logger) -> int:
         logger.error("DoS mode requires --i-understand flag to acknowledge risks")
         return 1
 
+    if args.task_timeout > 0:
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        logger.info(f"Task timeout set to {args.task_timeout}s; note that Pillow's C decode paths may not honor SIGALRM")
+
     creator = DosImageCreator(logger)
 
     dos_tasks = []
@@ -947,7 +1130,17 @@ def cmd_dos(args, logger: logging.Logger) -> int:
                 continue
 
             logger.info(f"Creating {name}...")
-            if func(path):
+            try:
+                if args.task_timeout > 0:
+                    signal.alarm(args.task_timeout)
+                ok = func(path)
+            except TimeoutError:
+                logger.warning(f"Timeout creating {name}")
+                ok = False
+            finally:
+                if args.task_timeout > 0:
+                    signal.alarm(0)
+            if ok:
                 successful += 1
             else:
                 failed += 1
@@ -957,6 +1150,66 @@ def cmd_dos(args, logger: logging.Logger) -> int:
     print(f"Time: {time.time() - start_time:.2f}s")
 
     return 0 if failed == 0 else 1
+
+# --- CLI Helpers ---
+def make_enum_list_action(enum_class):
+    """Return an argparse Action class that parses comma-separated values
+    and validates each against the given Enum. Fails fast on unknown values."""
+    valid = {e.value for e in enum_class}
+
+    class _EnumListAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            raw = values or ''
+            items = [v.strip() for v in raw.split(',') if v.strip()]
+            invalid = [v for v in items if v not in valid]
+            if invalid:
+                parser.error(
+                    f"argument {option_string}: invalid value(s) {invalid}; "
+                    f"valid: {', '.join(sorted(valid))}"
+                )
+            setattr(namespace, self.dest, items)
+
+    return _EnumListAction
+
+
+def png_text_keyword_type(value: str) -> str:
+    """Validate a --png-text-keyword value per PNG spec (1-79 bytes Latin-1, no nulls, no edge whitespace)."""
+    if not value:
+        raise argparse.ArgumentTypeError("--png-text-keyword must not be empty")
+    if '\x00' in value:
+        raise argparse.ArgumentTypeError("--png-text-keyword must not contain null bytes")
+    if value != value.strip():
+        raise argparse.ArgumentTypeError("--png-text-keyword must not have leading/trailing whitespace")
+    try:
+        encoded = value.encode('latin-1')
+    except UnicodeEncodeError:
+        raise argparse.ArgumentTypeError("--png-text-keyword must be Latin-1 encodable")
+    if not 1 <= len(encoded) <= 79:
+        raise argparse.ArgumentTypeError(f"--png-text-keyword must be 1-79 bytes (got {len(encoded)})")
+    return value
+
+
+def non_negative_int(value: str) -> int:
+    v = int(value)
+    if v < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return v
+
+
+def _apply_deterministic_seed(seed: int, logger: logging.Logger) -> None:
+    """Seed random and monkey-patch uuid.uuid4 so --seed actually produces deterministic runs.
+    Must be called in the main process before any fork."""
+    random.seed(seed)
+
+    def _seeded_uuid4():
+        return uuid.UUID(bytes=bytes(random.getrandbits(8) for _ in range(16)), version=4)
+
+    uuid.uuid4 = _seeded_uuid4
+    logger.warning(
+        "--seed set: UUIDs are now deterministic and NOT cryptographically random. "
+        "Do not use this run's outputs for security-sensitive identification."
+    )
+
 
 # --- Main Entry Point ---
 def main():
@@ -985,18 +1238,27 @@ Examples:
     inject_parser.add_argument('-o', '--output', default=DEFAULT_OUTPUT_DIR, help='Output directory')
     inject_parser.add_argument('--payload-format', choices=['text', 'hex', 'base64', 'file'],
                               default='text', help='Payload encoding format')
-    inject_parser.add_argument('--mutations', default='header,body,trailer',
-                              help='Comma-separated mutation types')
+    inject_parser.add_argument('--mutations', default=['header', 'body', 'trailer'],
+                              action=make_enum_list_action(InjectionType),
+                              help='Comma-separated mutation types (validated against InjectionType)')
     inject_parser.add_argument('--pattern', default='*', help='File glob pattern')
     inject_parser.add_argument('--recursive', action='store_true', help='Scan recursively')
     inject_parser.add_argument('--executor', choices=['thread', 'process'],
                               help='Executor type (default: auto)')
     inject_parser.add_argument('--dry-run', action='store_true', help='Show what would be done')
     inject_parser.add_argument('--resume', action='store_true', help='Skip existing files')
-    inject_parser.add_argument('--validate', action='store_true', help='Validate output files')
+    inject_parser.add_argument('--validate', action='store_true',
+                              help='Validate output with img.verify() (fast)')
+    inject_parser.add_argument('--validate-deep', action='store_true',
+                              help='Also force pixel decode via img.load() (slower). Implies --validate.')
     inject_parser.add_argument('--manifest', action='store_true', help='Generate manifest')
     inject_parser.add_argument('--manifest-format', choices=['json', 'csv'], default='json')
     inject_parser.add_argument('--force', action='store_true', help='Overwrite existing output')
+    inject_parser.add_argument('--png-text-keyword', type=png_text_keyword_type,
+                              default=DEFAULT_PNG_TEXT_KEYWORD,
+                              help='Keyword for PNG tEXt chunk injection (1-79 bytes, default: Comment)')
+    inject_parser.add_argument('--task-timeout', type=non_negative_int, default=DEFAULT_TASK_TIMEOUT,
+                              help=f'Per-mutation timeout in seconds via SIGALRM (0 disables, default: {DEFAULT_TASK_TIMEOUT})')
     inject_parser.add_argument('-v', '--verbose', action='count', default=0)
     inject_parser.add_argument('--log-file', help='Log file path')
     inject_parser.add_argument('--seed', type=int, help='Random seed for reproducibility')
@@ -1004,12 +1266,16 @@ Examples:
     # DoS command
     dos_parser = subparsers.add_parser('dos', help='Create DoS test images')
     dos_parser.add_argument('-o', '--output', default=DEFAULT_OUTPUT_DIR, help='Output directory')
-    dos_parser.add_argument('--dos-types', default='pixel_flood,long_body,decompression_bomb,iccp_dos',
-                           help='Comma-separated DoS types')
+    dos_parser.add_argument('--dos-types',
+                           default=['pixel_flood', 'long_body', 'decompression_bomb', 'iccp_dos'],
+                           action=make_enum_list_action(DosType),
+                           help='Comma-separated DoS types (validated against DosType)')
     dos_parser.add_argument('--i-understand', action='store_true',
                            help='Acknowledge DoS mode risks')
     dos_parser.add_argument('--resume', action='store_true')
     dos_parser.add_argument('--force', action='store_true')
+    dos_parser.add_argument('--task-timeout', type=non_negative_int, default=DEFAULT_TASK_TIMEOUT,
+                           help=f'Per-operation timeout in seconds via SIGALRM (0 disables, default: {DEFAULT_TASK_TIMEOUT})')
     dos_parser.add_argument('-v', '--verbose', action='count', default=0)
     dos_parser.add_argument('--log-file', help='Log file path')
 
@@ -1028,9 +1294,13 @@ Examples:
         if dos_mode and not args.i_understand:
             return 1
 
-    # Set random seed if provided
+    # Apply deterministic seed (main process, before any fork or executor creation)
     if hasattr(args, 'seed') and args.seed is not None:
-        random.seed(args.seed)
+        _apply_deterministic_seed(args.seed, logger)
+
+    # --validate-deep implies --validate
+    if getattr(args, 'validate_deep', False):
+        args.validate = True
 
     # Check output safety
     if not check_output_safety(args.output, args.force, logger):
@@ -1038,12 +1308,6 @@ Examples:
 
     # Create output directory
     os.makedirs(args.output, exist_ok=True)
-
-    # Parse list arguments
-    if hasattr(args, 'mutations'):
-        args.mutations = [m.strip() for m in args.mutations.split(',')]
-    if hasattr(args, 'dos_types'):
-        args.dos_types = [t.strip() for t in args.dos_types.split(',')]
 
     # Execute command
     if args.command == 'inject':
